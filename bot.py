@@ -2,10 +2,10 @@
 Telegram-бот корпоративной базы знаний ИТ-службы.
 
 Функциональность:
-- при старте сканирует .md файлы в папке скрипта и разбивает их на пункты;
+- при старте сканирует .md и .docx файлы в папке скрипта и разбивает их на пункты;
 - поиск пункта по тексту запроса без БД и ML (стоп-слова + SequenceMatcher);
 - ответы форматируются в HTML;
-- отправка регламента (.md файлов) по команде.
+- отправка регламента (.md и .docx файлов) по команде.
 
 Запуск: BOT_TOKEN=xxxx python bot.py
 """
@@ -29,6 +29,8 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+from docx import Document as DocxDocument
+from docx.opc.exceptions import PackageNotFoundError
 
 # ---------------------------------------------------------------------------
 # Логирование
@@ -108,14 +110,38 @@ class KnowledgeItem:
         self.source = source
 
 
-def parse_md_file(path: Path) -> list[KnowledgeItem]:
-    """Разбивает один .md файл на список пунктов."""
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Не удалось прочитать файл %s: %s", path, exc)
-        return []
+def extract_text_from_md(path: Path) -> str:
+    """Читает содержимое .md файла как есть."""
+    return path.read_text(encoding="utf-8")
 
+
+def extract_text_from_docx(path: Path) -> str:
+    """Извлекает текст из .docx файла: параграфы (включая заголовки) и таблицы.
+
+    ВАЖНО: номер пункта должен быть напечатан в самом тексте абзаца
+    (например «1.2 Название»). Автоматическая нумерация списков Word
+    (когда цифры генерируются самим Word и не хранятся как текст)
+    не считывается — её нужно вписывать вручную.
+    """
+    document = DocxDocument(str(path))
+    lines: list[str] = []
+
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if text:
+            lines.append(text)
+
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                lines.append(" | ".join(cells))
+
+    return "\n".join(lines)
+
+
+def split_into_items(content: str, source_name: str) -> list[KnowledgeItem]:
+    """Разбивает произвольный текст на пункты по номерам ("1.", "1.2", "# 1.2")."""
     matches = list(ITEM_PATTERN.finditer(content))
     items: list[KnowledgeItem] = []
 
@@ -132,34 +158,64 @@ def parse_md_file(path: Path) -> list[KnowledgeItem]:
                 number=number,
                 title=title,
                 text=full_text,
-                source=path.name,
+                source=source_name,
             )
         )
 
+    return items
+
+
+def parse_source_file(path: Path) -> list[KnowledgeItem]:
+    """Читает файл регламента (.md или .docx) и разбивает его на пункты."""
+    suffix = path.suffix.lower()
+
+    try:
+        if suffix == ".md":
+            content = extract_text_from_md(path)
+        elif suffix == ".docx":
+            content = extract_text_from_docx(path)
+        else:
+            logger.warning("Неподдерживаемый тип файла, пропускаю: %s", path)
+            return []
+    except PackageNotFoundError:
+        logger.error(
+            "Файл %s повреждён или не является настоящим .docx (возможно, это .doc)",
+            path,
+        )
+        return []
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Не удалось прочитать файл %s: %s", path, exc)
+        return []
+
+    items = split_into_items(content, path.name)
     logger.info("Файл %s: найдено пунктов — %d", path.name, len(items))
     return items
 
 
 def load_knowledge_base(directory: Path) -> tuple[list[KnowledgeItem], list[Path]]:
-    """Ищет все .md файлы в папке и разбирает их на пункты."""
-    md_files = sorted(directory.glob("*.md"))
+    """Ищет все .md и .docx файлы в папке и разбирает их на пункты."""
+    source_files = sorted(directory.glob("*.md")) + sorted(directory.glob("*.docx"))
+    # Исключаем временные файлы Word (~$файл.docx), создаваемые при открытом документе
+    source_files = [f for f in source_files if not f.name.startswith("~$")]
 
-    if not md_files:
-        logger.warning("В папке %s не найдено ни одного .md файла", directory)
+    if not source_files:
+        logger.warning(
+            "В папке %s не найдено ни одного .md или .docx файла", directory
+        )
 
     all_items: list[KnowledgeItem] = []
-    for md_file in md_files:
-        all_items.extend(parse_md_file(md_file))
+    for source_file in source_files:
+        all_items.extend(parse_source_file(source_file))
 
     logger.info(
         "База знаний загружена: файлов — %d, пунктов — %d",
-        len(md_files), len(all_items),
+        len(source_files), len(all_items),
     )
-    return all_items, md_files
+    return all_items, source_files
 
 
 KNOWLEDGE_ITEMS: list[KnowledgeItem] = []
-MD_FILES: list[Path] = []
+SOURCE_FILES: list[Path] = []
 
 # ---------------------------------------------------------------------------
 # Поиск пункта (без БД и ML)
@@ -248,7 +304,7 @@ HELP_TEXT = (
     "❓ <b>Что я умею</b>\n\n"
     "• /start — приветствие и главное меню\n"
     "• /help — эта справка\n"
-    "• /reglament — пришлю файлы регламента целиком\n"
+    "• /reglament — пришлю файлы регламента целиком (.md и .docx)\n"
     "• Любой другой текст — найду подходящий пункт регламента "
     "по смыслу вашего вопроса\n\n"
     "Если пункт не найден, я так и сообщу и не буду ничего придумывать."
@@ -261,7 +317,7 @@ NOT_FOUND_TEXT = (
 )
 
 NO_FILES_TEXT = (
-    "⚠️ Файлы регламента пока не найдены рядом со скриптом бота.\n"
+    "⚠️ Файлы регламента (.md или .docx) пока не найдены рядом со скриптом бота.\n"
     "Обратитесь к администратору базы знаний."
 )
 
@@ -295,18 +351,18 @@ async def handle_reglament(message: Message) -> None:
     user_id = message.from_user.id if message.from_user else "?"
     logger.info("Пользователь %s запросил регламент", user_id)
 
-    if not MD_FILES:
+    if not SOURCE_FILES:
         await message.answer(NO_FILES_TEXT, reply_markup=MAIN_KEYBOARD)
         return
 
-    for md_file in MD_FILES:
+    for source_file in SOURCE_FILES:
         try:
-            document = FSInputFile(md_file)
+            document = FSInputFile(source_file)
             await message.answer_document(document)
         except Exception as exc:  # noqa: BLE001
-            logger.error("Не удалось отправить файл %s пользователю %s: %s", md_file, user_id, exc)
+            logger.error("Не удалось отправить файл %s пользователю %s: %s", source_file, user_id, exc)
             await message.answer(
-                f"⚠️ Не удалось отправить файл {html.escape(md_file.name)}."
+                f"⚠️ Не удалось отправить файл {html.escape(source_file.name)}."
             )
 
     await message.answer("Это все файлы регламента.", reply_markup=MAIN_KEYBOARD)
@@ -352,8 +408,8 @@ async def main() -> None:
         )
         raise SystemExit(1)
 
-    global KNOWLEDGE_ITEMS, MD_FILES
-    KNOWLEDGE_ITEMS, MD_FILES = load_knowledge_base(SCRIPT_DIR)
+    global KNOWLEDGE_ITEMS, SOURCE_FILES
+    KNOWLEDGE_ITEMS, SOURCE_FILES = load_knowledge_base(SCRIPT_DIR)
 
     bot = Bot(
         token=BOT_TOKEN,
